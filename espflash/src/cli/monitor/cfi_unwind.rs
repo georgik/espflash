@@ -16,19 +16,8 @@
 use std::{collections::HashMap, hash::Hash};
 
 use gimli::{
-    BaseAddresses,
-    CfaRule,
-    CieOrFde,
-    CommonInformationEntry,
-    DebugFrame,
-    EhFrame,
-    EndianSlice,
-    FrameDescriptionEntry,
-    Register,
-    RegisterRule,
-    RunTimeEndian,
-    UnwindContext,
-    UnwindSection,
+    BaseAddresses, CfaRule, CieOrFde, CommonInformationEntry, DebugFrame, EhFrame, EndianSlice,
+    FrameDescriptionEntry, Register, RegisterRule, RunTimeEndian, UnwindContext, UnwindSection,
 };
 use object::{Object, ObjectSection, SectionKind};
 
