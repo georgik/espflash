@@ -23,8 +23,13 @@ use self::reset::UnixTightReset;
 use self::{
     encoder::SlipEncoder,
     reset::{
-        ClassicReset, ResetStrategy, UsbJtagSerialReset, construct_reset_strategy_sequence,
-        hard_reset, reset_after_flash, soft_reset,
+        ClassicReset,
+        ResetStrategy,
+        UsbJtagSerialReset,
+        construct_reset_strategy_sequence,
+        hard_reset,
+        reset_after_flash,
+        soft_reset,
     },
 };
 use crate::{
@@ -365,7 +370,8 @@ impl Connection {
     /// Syncs with a device.
     pub(crate) fn sync(&mut self) -> Result<(), Error> {
         // `command` already sends the command + a Sync "poke", then reads and
-        // validates the deferred reply (handles the P4 one-command pipeline lag).
+        // validates the deferred reply (handles the P4 one-command pipeline
+        // lag).
         self.with_timeout(CommandType::Sync.timeout(), |connection| {
             connection.command(Command::Sync)
         })?;
@@ -598,8 +604,8 @@ impl Connection {
 
     /// Writes raw data to the serial port.
     pub fn write_raw(&mut self, data: u32) -> Result<(), Error> {
-        // Same stub-mode caveat as write_command: skip tcdrain in stub mode so we
-        // never block on the not-yet-draining RAM flash stub RX endpoint.
+        // Same stub-mode caveat as write_command: skip tcdrain in stub mode so
+        // we never block on the not-yet-draining RAM flash stub RX endpoint.
         let use_flush = !self.stub_mode;
         let serial = &mut self.serial;
 
@@ -623,12 +629,13 @@ impl Connection {
         let serial = &mut self.serial;
 
         serial.clear(serialport::ClearBuffer::Input)?;
-        // Encode the full SLIP frame into a Vec so a single write_all() pushes it
-        // out. We flush (tcdrain) so the bytes are physically transmitted and we
-        // know the chip received them. In ROM mode the ROM bootloader drains the
-        // endpoint so tcdrain returns quickly. In stub mode tcdrain only returns
-        // once the RAM flash stub has read the bytes -- if it never reads, this
-        // hangs, which is itself the diagnostic that the stub is not serving.
+        // Encode the full SLIP frame into a Vec so a single write_all() pushes
+        // it out. We flush (tcdrain) so the bytes are physically transmitted
+        // and we know the chip received them. In ROM mode the ROM bootloader
+        // drains the endpoint so tcdrain returns quickly. In stub mode tcdrain
+        // only returns once the RAM flash stub has read the bytes -- if it
+        // never reads, this hangs, which is itself the diagnostic that the stub
+        // is not serving.
         let mut buf = Vec::new();
         {
             let mut encoder = SlipEncoder::new(&mut buf)?;
@@ -645,10 +652,10 @@ impl Connection {
     /// Writes a command and reads the response.
     ///
     /// The ESP32-P4 ROM bootloader (and, apparently, its RAM flash stub) defers
-    /// the response to a command until the NEXT command is received (one-command
-    /// pipeline lag). Sending a follow-up Sync "poke" flushes the queued reply.
-    /// A wall-clock deadline guards against a silent chip so we fail fast
-    /// instead of blocking forever. See
+    /// the response to a command until the NEXT command is received
+    /// (one-command pipeline lag). Sending a follow-up Sync "poke" flushes the
+    /// queued reply. A wall-clock deadline guards against a silent chip so we
+    /// fail fast instead of blocking forever. See
     /// wiki/esp32-p4-slip-attach-failure-report.md.
     pub fn command(&mut self, command: Command<'_>) -> Result<CommandResponseValue, Error> {
         let ty = command.command_type();
@@ -658,9 +665,9 @@ impl Connection {
         // (one-command pipeline lag), so we send a follow-up Sync "poke" to
         // flush the queued reply. We send the poke in BOTH modes: the P4 RAM
         // flash stub appears to defer replies like the ROM, so without the poke
-        // the reply never arrives (stub looked silent). In stub mode we skip the
-        // trailing flush() (tcdrain) to avoid the hang, but the poke write is
-        // fine. See wiki/esp32-p4-slip-attach-failure-report.md.
+        // the reply never arrives (stub looked silent). In stub mode we skip
+        // the trailing flush() (tcdrain) to avoid the hang, but the poke write
+        // is fine. See wiki/esp32-p4-slip-attach-failure-report.md.
         self.write_command(Command::Sync)
             .for_command(CommandType::Sync)?;
         // In ROM mode we flush so the command is fully transmitted before we
@@ -687,9 +694,10 @@ impl Connection {
             }
         }
 
-        // A generous wall-clock deadline. The P4 ROM defers each reply until the
-        // next command, so after the "poke" the real reply can be delayed; and a
-        // priming-sync backlog can leave many stale frames to drain first.
+        // A generous wall-clock deadline. The P4 ROM defers each reply until
+        // the next command, so after the "poke" the real reply can be delayed;
+        // and a priming-sync backlog can leave many stale frames to drain
+        // first.
         let deadline = Instant::now() + Duration::from_secs(8);
 
         let stub_mode = self.stub_mode;
