@@ -654,6 +654,7 @@ impl Flasher {
             // Load flash stub if enabled.
             if use_stub {
                 info!("Using flash stub");
+                std::io::stderr().flush().ok();
                 if let Err(e) = flasher.load_stub() {
                     return Err(Box::new((e, flasher.into_connection())));
                 }
@@ -803,6 +804,7 @@ impl Flasher {
 
     fn load_stub(&mut self) -> Result<(), Error> {
         debug!("Loading flash stub for chip: {:?}", self.chip);
+        std::io::stderr().flush().ok();
 
         // Get chip revision for ESP32-P4 (needed to select correct stub)
         let revision = if matches!(self.chip, Chip::Esp32p4) {
@@ -861,9 +863,11 @@ impl Flasher {
             .flashing()?;
 
         debug!("Finish stub write");
+        std::io::stderr().flush().ok();
         ram_target.finish(&mut self.connection, true).flashing()?;
 
         debug!("Stub written!");
+        std::io::stderr().flush().ok();
 
         match self.connection.read(EXPECTED_STUB_HANDSHAKE.len())? {
             Some(resp) if resp == EXPECTED_STUB_HANDSHAKE.as_bytes() => Ok(()),
@@ -872,9 +876,18 @@ impl Flasher {
             ))),
         }?;
 
-        // Re-detect chip to check stub is up
-        let chip = self.connection.detect_chip(self.use_stub)?;
-        debug!("Re-detected chip: {chip:?}");
+        // The RAM flash stub is now serving commands. It replies immediately
+        // (no one-command pipeline lag), so command() must stop sending the
+        // ROM "poke" Sync. See wiki/esp32-p4-slip-attach-failure-report.md.
+        self.connection.stub_mode = true;
+        std::io::stderr().flush().ok();
+
+        // Give the stub a brief moment to enter its command loop after the
+        // MemEnd jump and to let the USB-JTAG/serial link settle. The very
+        // first command sent immediately after OHAI is otherwise lost on the
+        // P4, which previously left the stub appearing silent to the first
+        // command. See wiki report.
+        std::thread::sleep(std::time::Duration::from_millis(250));
 
         Ok(())
     }

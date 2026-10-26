@@ -7,10 +7,9 @@
 use std::{
     collections::HashMap,
     fmt,
-    io::{BufWriter, Read, Write},
+    io::{Read, Write},
     iter::zip,
-    thread::sleep,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use log::{debug, info};
@@ -235,6 +234,13 @@ pub struct Connection {
     before_operation: ResetBeforeOperation,
     pub(crate) secure_download_mode: bool,
     pub(crate) baud: u32,
+    /// Whether the RAM flash stub is currently loaded and serving commands.
+    /// The P4 ROM bootloader defers command replies until the next command is
+    /// received (one-command pipeline lag), so a follow-up "poke" Sync is
+    /// required in ROM mode. The stub replies immediately, so the poke is
+    /// unnecessary and actually disrupts it. See
+    /// wiki/esp32-p4-slip-attach-failure-report.md.
+    pub(crate) stub_mode: bool,
 }
 
 impl Connection {
@@ -254,6 +260,7 @@ impl Connection {
             before_operation,
             secure_download_mode: false,
             baud,
+            stub_mode: false,
         }
     }
 
@@ -362,33 +369,11 @@ impl Connection {
 
     /// Syncs with a device.
     pub(crate) fn sync(&mut self) -> Result<(), Error> {
+        // `command` already sends the command + a Sync "poke", then reads and
+        // validates the deferred reply (handles the P4 one-command pipeline
+        // lag).
         self.with_timeout(CommandType::Sync.timeout(), |connection| {
-            connection.command(Command::Sync)?;
-            connection.flush()?;
-
-            sleep(Duration::from_millis(10));
-
-            for _ in 0..MAX_CONNECT_ATTEMPTS {
-                match connection.read_response_for_command(CommandType::Sync)? {
-                    Some(response) if response.return_op == CommandType::Sync as u8 => {
-                        if response.status == 1 {
-                            connection.flush().ok();
-                            return Err(Error::RomError(Box::new(RomError::new(
-                                CommandType::Sync,
-                                RomErrorKind::from(response.error),
-                            ))));
-                        }
-                    }
-                    _ => {
-                        return Err(Error::RomError(Box::new(RomError::new(
-                            CommandType::Sync,
-                            RomErrorKind::InvalidMessage,
-                        ))));
-                    }
-                }
-            }
-
-            Ok(())
+            connection.command(Command::Sync)
         })?;
 
         Ok(())
@@ -619,65 +604,167 @@ impl Connection {
 
     /// Writes raw data to the serial port.
     pub fn write_raw(&mut self, data: u32) -> Result<(), Error> {
-        let mut binding = Box::new(&mut self.serial);
-        let serial = binding.as_mut();
+        // Same stub-mode caveat as write_command: skip tcdrain in stub mode so
+        // we never block on the not-yet-draining RAM flash stub RX endpoint.
+        let use_flush = !self.stub_mode;
+        let serial = &mut self.serial;
+
         serial.clear(serialport::ClearBuffer::Input)?;
-        let mut writer = BufWriter::new(serial);
-        let mut encoder = SlipEncoder::new(&mut writer)?;
-        encoder.write_all(&data.to_le_bytes())?;
-        encoder.finish()?;
-        writer.flush()?;
+        let mut buf = Vec::new();
+        {
+            let mut encoder = SlipEncoder::new(&mut buf)?;
+            encoder.write_all(&data.to_le_bytes())?;
+            encoder.finish()?;
+        }
+        serial.write_all(&buf)?;
+        if use_flush {
+            serial.flush()?;
+        }
         Ok(())
     }
 
     /// Writes a command to the serial port.
     pub fn write_command(&mut self, command: Command<'_>) -> Result<(), Error> {
         debug!("Writing command: {command:02x?}");
-        let mut binding = Box::new(&mut self.serial);
-        let serial = binding.as_mut();
+        let serial = &mut self.serial;
 
         serial.clear(serialport::ClearBuffer::Input)?;
-        let mut writer = BufWriter::new(serial);
-        let mut encoder = SlipEncoder::new(&mut writer)?;
-        command.write(&mut encoder)?;
-        encoder.finish()?;
-        writer.flush()?;
+        // Encode the full SLIP frame into a Vec so a single write_all() pushes
+        // it out. We flush (tcdrain) so the bytes are physically transmitted
+        // and we know the chip received them. In ROM mode the ROM bootloader
+        // drains the endpoint so tcdrain returns quickly. In stub mode tcdrain
+        // only returns once the RAM flash stub has read the bytes -- if it
+        // never reads, this hangs, which is itself the diagnostic that the stub
+        // is not serving.
+        let mut buf = Vec::new();
+        {
+            let mut encoder = SlipEncoder::new(&mut buf)?;
+            command.write(&mut encoder)?;
+            encoder.finish()?;
+        }
+        serial.write_all(&buf)?;
+        serial.flush()?;
+        debug!("write_command: wrote+flushed OK");
+        std::io::stderr().flush().ok();
         Ok(())
     }
 
     /// Writes a command and reads the response.
+    ///
+    /// The ESP32-P4 ROM bootloader (and, apparently, its RAM flash stub) defers
+    /// the response to a command until the NEXT command is received
+    /// (one-command pipeline lag). Sending a follow-up Sync "poke" flushes the
+    /// queued reply. A wall-clock deadline guards against a silent chip so we
+    /// fail fast instead of blocking forever. See
+    /// wiki/esp32-p4-slip-attach-failure-report.md.
     pub fn command(&mut self, command: Command<'_>) -> Result<CommandResponseValue, Error> {
         let ty = command.command_type();
+        debug!("command() ty={ty:?} stub_mode={}", self.stub_mode);
         self.write_command(command).for_command(ty)?;
-        for _ in 0..100 {
-            match self.read_response_for_command(ty)? {
-                Some(response) if response.return_op == ty as u8 => {
-                    return if response.status != 0 {
-                        let _error = self.flush();
-                        Err(Error::RomError(Box::new(RomError::new(
-                            command.command_type(),
-                            RomErrorKind::from(response.error),
-                        ))))
-                    } else {
-                        // Check if the response is a Vector and strip header
-                        // (first 8 bytes) https://github.com/espressif/esptool/blob/749d1ad/esptool/loader.py#L481
-                        let modified_value = match response.value {
-                            CommandResponseValue::Vector(mut vec) if vec.len() >= 8 => {
-                                vec = vec[8..][..response.return_length as usize].to_vec();
-                                CommandResponseValue::Vector(vec)
-                            }
-                            _ => response.value, // If not Vector, return as is
-                        };
-
-                        Ok(modified_value)
-                    };
-                }
-                _ => continue,
+        // The ESP32-P4 ROM defers each reply until the NEXT command is received
+        // (one-command pipeline lag), so we send a follow-up Sync "poke" to
+        // flush the queued reply. We send the poke in BOTH modes: the P4 RAM
+        // flash stub appears to defer replies like the ROM, so without the poke
+        // the reply never arrives (stub looked silent). In stub mode we skip
+        // the trailing flush() (tcdrain) to avoid the hang, but the poke write
+        // is fine. See wiki/esp32-p4-slip-attach-failure-report.md.
+        self.write_command(Command::Sync)
+            .for_command(CommandType::Sync)?;
+        // In ROM mode we flush so the command is fully transmitted before we
+        // read. In stub mode we must NOT flush(): right after the OHAI
+        // handshake the RAM flash stub is not yet reading commands, so
+        // flush() -> tcdrain() blocks forever waiting for the chip to consume
+        // the command we just wrote. The stub answers once it is in its command
+        // loop; see wiki/esp32-p4-slip-attach-failure-report.md.
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            if let Ok(mut _f) = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open("/tmp/dbg_stubmode.txt")
+            {
+                use std::io::Write;
+                let _ = _f.write_all(
+                    format!("DBG post-write ty={:?} stub_mode={}\n", ty, self.stub_mode).as_bytes(),
+                );
+            }
+            if !self.stub_mode {
+                self.flush()?;
             }
         }
-        Err(Error::Connection(Box::new(
-            ConnectionError::ConnectionFailed,
-        )))
+
+        // A generous wall-clock deadline. The P4 ROM defers each reply until
+        // the next command, so after the "poke" the real reply can be delayed;
+        // and a priming-sync backlog can leave many stale frames to drain
+        // first.
+        let deadline = Instant::now() + Duration::from_secs(8);
+
+        let stub_mode = self.stub_mode;
+        self.with_timeout(Duration::from_secs(1), |connection| {
+            debug!("command() entering read loop for {ty:?} (stub_mode={stub_mode})");
+            std::io::stderr().flush().ok();
+            let mut stale = 0usize;
+            loop {
+                match connection.read_response_for_command(ty) {
+                    Ok(Some(response)) if response.return_op == ty as u8 => {
+                        debug!(
+                            "matched {ty:?} response: resp={:#04x} len={}",
+                            response.resp, response.return_length
+                        );
+                        if response.status != 0 {
+                            return Err(Error::RomError(Box::new(RomError::new(
+                                ty,
+                                RomErrorKind::from(response.error),
+                            ))));
+                        }
+                        let value = match response.value {
+                            CommandResponseValue::Vector(vec) if vec.len() >= 8 => {
+                                let vec = vec[8..][..response.return_length as usize].to_vec();
+                                CommandResponseValue::Vector(vec)
+                            }
+                            _ => response.value,
+                        };
+                        return Ok(value);
+                    }
+                    // Stale frame (poke reply / priming-sync leftovers).
+                    Ok(_) => {
+                        stale += 1;
+                        if stale > 256 {
+                            break;
+                        }
+                    }
+                    // Timeout on this read -> the reply may just be late.
+                    Err(Error::Connection(boxed_ce)) => {
+                        match boxed_ce.downcast::<ConnectionError>() {
+                            Ok(boxed) if matches!(*boxed, ConnectionError::Timeout(_)) => {
+                                stale += 1;
+                                if stale > 256 {
+                                    break;
+                                }
+                            }
+                            Ok(boxed) => {
+                                return Err(Error::Connection(boxed));
+                            }
+                            Err(original) => {
+                                return Err(Error::Connection(original));
+                            }
+                        }
+                    }
+                    Err(other) => {
+                        return Err(other);
+                    }
+                }
+                if Instant::now() > deadline {
+                    debug!("command {ty:?} timed out after poke (no matching reply)");
+                    break;
+                }
+            }
+            Err(Error::Connection(Box::new(
+                ConnectionError::ConnectionFailed,
+            )))
+        })
+        .for_command(ty)
     }
 
     /// Reads a register command with a timeout.
@@ -723,10 +810,67 @@ impl Connection {
         len: usize,
         max_len: u64,
     ) -> Result<Option<Vec<u8>>, Error> {
+        // Grab the raw fd up front (immutable borrow) so we can poll it without
+        // conflicting with the mutable borrow of `serial` below.
+        #[cfg(unix)]
+        let raw_fd = {
+            use std::os::fd::AsRawFd;
+            self.serial.as_raw_fd()
+        };
         let mut tmp = Vec::with_capacity(1024);
         let mut serial = (&mut self.serial).take(max_len);
+        // Wall-clock deadline so a silent device fails fast instead of
+        // blocking forever. The serialport read timeout does NOT reliably
+        // interrupt the kernel read on this USB-JTAG/serial device (a read can
+        // block past the configured timeout when the chip is momentarily
+        // silent), so gating decode() on the deadline alone is not enough --
+        // decode() can hang before the deadline is ever checked. We therefore
+        // poll the raw fd with the *remaining* time before every decode(): this
+        // guarantees we never block longer than the deadline and fail fast on
+        // POLLERR/POLLHUP. Raised to match command()'s deadline: draining a
+        // priming-sync backlog can take a moment before the delayed reply.
+        let deadline = Instant::now() + Duration::from_secs(8);
         loop {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_default();
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
+            #[cfg(unix)]
+            {
+                let mut pfd = libc::pollfd {
+                    fd: raw_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let rc = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+                if rc < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.kind() != std::io::ErrorKind::Interrupted {
+                        return Err(Error::Connection(Box::new(ConnectionError::from(err))));
+                    }
+                    continue; // EINTR: re-poll
+                }
+                if pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                    return Err(Error::Connection(Box::new(ConnectionError::from(
+                        std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "serial device hangup",
+                        ),
+                    ))));
+                }
+                if pfd.revents & libc::POLLIN == 0 {
+                    // Timed out waiting for data -> silent device.
+                    debug!("poll: no data within deadline (timeout_ms={timeout_ms})");
+                    std::io::stderr().flush().ok();
+                    return Ok(None);
+                }
+            }
+            // Data is ready -> decode the next frame's worth.
             self.decoder.decode(&mut serial, &mut tmp)?;
+            debug!("RX {:02x?}", tmp);
             if tmp.len() >= len {
                 return Ok(Some(tmp));
             }
@@ -735,7 +879,11 @@ impl Connection {
 
     /// Flushes  the serial port.
     pub fn flush(&mut self) -> Result<(), Error> {
+        debug!("flush() called");
+        std::io::stderr().flush().ok();
         self.serial.flush()?;
+        debug!("flush() done");
+        std::io::stderr().flush().ok();
         Ok(())
     }
 
